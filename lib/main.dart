@@ -1,4 +1,9 @@
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   runApp(const MyApp());
@@ -55,17 +60,55 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+  String _myAddress = "";
+  MediaStream? _localStream;
+  final RTCVideoRenderer _renderer = RTCVideoRenderer();
+  List<MediaDeviceInfo> _devices = [];
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+  var senders = <RTCRtpSender>[];
+  RTCPeerConnection? _peerConnection;
+
+  @override
+  void initState() {
+    super.initState();
+    NetworkInterface.list().then((value) {
+      final address = value
+          .firstWhere(
+              (conn) => conn.name.contains("wlan") || conn.name.contains("en"))
+          .addresses
+          .firstOrNull
+          ?.address;
+      setState(() {
+        _myAddress = address ?? "";
+      });
     });
+    _renderer.initialize();
+    loadDevices();
+  }
+
+  Future<void> loadDevices() async {
+    if (WebRTC.platformIsAndroid || WebRTC.platformIsIOS) {
+      //Ask for runtime permissions if necessary.
+      var status = await Permission.bluetooth.request();
+      if (status.isPermanentlyDenied) {
+        print('BLEpermdisabled');
+      }
+
+      status = await Permission.bluetoothConnect.request();
+      if (status.isPermanentlyDenied) {
+        print('ConnectPermdisabled');
+      }
+    }
+    final devices = await navigator.mediaDevices.enumerateDevices();
+    setState(() {
+      _devices = devices;
+    });
+  }
+
+  @override
+  void deactivate() {
+    super.deactivate();
+    _renderer.dispose();
   }
 
   @override
@@ -103,23 +146,119 @@ class _MyHomePageState extends State<MyHomePage> {
           // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
           // action in the IDE, or press "p" in the console), to see the
           // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
-            const Text(
-              'You have pushed the button this many times:',
+            Row(
+              children: [
+                Text("my address: "),
+                Text(_myAddress),
+              ],
             ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            TextButton(
+              onPressed: () => _start(),
+              child: Text("Start"),
+            ),
+            Expanded(
+              child: Container(
+                margin: const EdgeInsets.fromLTRB(0, 0, 0, 0),
+                decoration: BoxDecoration(color: Colors.black54),
+                child: RTCVideoView(_renderer),
+              ),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
+  }
+
+  Future<void> _start() async {
+    final serverSocket = await ServerSocket.bind(_myAddress, 10001);
+    serverSocket.listen((client) {
+      client.listen(
+        (Uint8List data) async {
+          try {
+            final remoteAddress = client.remoteAddress;
+            final offer = String.fromCharCodes(data);
+
+            final localStream = await navigator.mediaDevices.getUserMedia({
+              'audio': true,
+              'video': true,
+            });
+
+            await initPCs();
+
+            final audioTracks = localStream.getAudioTracks();
+            if (audioTracks.isNotEmpty) {
+              final track = audioTracks.first;
+              await _peerConnection?.addTrack(track, localStream);
+            }
+
+            final tracks = localStream.getVideoTracks();
+            if (tracks.isNotEmpty) {
+              final track = localStream.getVideoTracks().first;
+              var rtpSender =
+                  await _peerConnection?.addTrack(track, localStream);
+              senders.add(rtpSender!);
+              rtpSender.parameters.encodings?.forEach((item) {
+                item.maxBitrate = 10000 * 1000 * 8;
+                item.scaleResolutionDownBy = 2.0;
+              });
+            }
+
+            await _peerConnection?.setRemoteDescription(RTCSessionDescription(offer, "offer"));
+            var answer = await _peerConnection?.createAnswer();
+            await _peerConnection?.setLocalDescription(answer!);
+
+            final clientSocket =
+                await Socket.connect(remoteAddress.address, 10002);
+            clientSocket.write(answer?.sdp);
+            clientSocket.close();
+            serverSocket.close();
+            setState(() {});
+          } catch (e) {
+            print(e.toString());
+          }
+        },
+        // handle errors
+        onError: (error) {
+          print("client onError $error");
+          client.close();
+        },
+        // handle the closing the connection
+        onDone: () {
+          print("client onDone");
+          client.close();
+        },
+      );
+    }, onDone: () {
+      print("server onDone");
+    }, onError: (e) {
+      print("server onError $e");
+    });
+  }
+
+  Future<void> initPCs() async {
+    _peerConnection ??= await createPeerConnection({});
+
+    _peerConnection?.onTrack = (event) {
+      if (event.track.kind == 'video') {
+        _renderer.srcObject = event.streams[0];
+        setState(() {});
+      }
+    };
+
+    _peerConnection?.onConnectionState = (state) {
+      print('connectionState $state');
+    };
+
+    _peerConnection?.onIceConnectionState = (state) {
+      print('iceConnectionState $state');
+    };
+
+    // await _peerConnection?.addTransceiver(
+    //     kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
+    //     init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv));
+    // await _peerConnection?.addTransceiver(
+    //     kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+    //     init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv));
   }
 }
